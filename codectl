@@ -1,0 +1,920 @@
+#!/bin/bash
+
+set -euo pipefail
+
+readonly SCRIPT_NAME="$(basename "$0")"
+
+# Detect if running as root and configure paths accordingly
+readonly IS_ROOT=$([[ $EUID -eq 0 ]] && echo true || echo false)
+readonly SERVICE_NAME="vscode-server"
+
+# Set mode-specific values
+if [[ "$IS_ROOT" == "true" ]]; then
+    # Root mode - system-wide installation
+    readonly CODECTL_HOME="${CODECTL_HOME:-/opt/codectl}"
+    readonly SYSTEMD_DIR="/etc/systemd/system"
+    readonly TARGET_USER="${CODECTL_USER:-coder}"
+    readonly TARGET_GROUP="${CODECTL_GROUP:-coder}"
+    readonly SYSTEMCTL_CMD="systemctl"
+else
+    # User mode - user-local installation
+    readonly CODECTL_HOME="${CODECTL_HOME:-$HOME/.codectl}"
+    readonly SYSTEMD_DIR="$HOME/.config/systemd/user"
+    readonly TARGET_USER="$(whoami)"
+    readonly TARGET_GROUP="$(id -gn)"
+    readonly SYSTEMCTL_CMD="systemctl --user"
+fi
+
+# Common paths derived from CODECTL_HOME
+readonly INSTALL_DIR="$CODECTL_HOME/current"
+readonly VERSIONS_DIR="$CODECTL_HOME/versions"
+readonly TEMP_DIR="$CODECTL_HOME/tmp/upgrade-$$"
+
+usage() {
+    cat << EOF
+Usage: $SCRIPT_NAME <version> [options]
+
+Install or upgrade VS Code server to the specified version using symlink-based version management.
+Supports code-server, openvscode-server, and vscodium.
+Runs in user mode (non-root) or system mode (root) automatically.
+
+Arguments:
+    version         Version to install (e.g., 4.22.1 for code-server, 1.103.1 for openvscode, 1.103.25610 for vscodium)
+
+Options:
+    --type TYPE         Server type: code-server (default), openvscode, or vscodium
+    --rollback          Rollback to the previous version
+    --list              List installed versions
+    --list-remote       List available versions from GitHub
+    --latest            Install the latest stable version from GitHub
+    --current           Show current version
+    --cleanup           Remove old versions (keeps current + 2 previous)
+    --install-service   Install systemd service for current or specified version
+    --remove-service    Remove systemd service
+    --service-status    Show service status
+    --dry-run           Show what would be done without executing
+    --help              Show this help message
+
+Mode Information:
+    User mode:      Uses ~/.codectl/ and user systemd services
+    System mode:    Uses /opt/codectl/ and system systemd services (requires root)
+    
+Environment Variables (root mode):
+    CODECTL_USER    Target user for installations (default: coder)
+    CODECTL_GROUP   Target group for installations (default: coder)
+    CODECTL_HOME    Installation directory (default: /opt/codectl for root, ~/.codectl for user)
+
+Examples:
+    $SCRIPT_NAME 4.22.1                    # Install code-server v4.22.1
+    $SCRIPT_NAME 1.103.1 --type openvscode # Install openvscode v1.103.1
+    $SCRIPT_NAME 1.103.25610 --type vscodium # Install vscodium v1.103.25610
+    $SCRIPT_NAME --latest                   # Install latest code-server version
+    $SCRIPT_NAME --latest --type openvscode # Install latest openvscode version
+    $SCRIPT_NAME --latest --type vscodium   # Install latest vscodium version
+    $SCRIPT_NAME --rollback
+    $SCRIPT_NAME --list                     # List installed versions
+    $SCRIPT_NAME --list-remote              # List available code-server versions
+    $SCRIPT_NAME --list-remote --type openvscode # List available openvscode versions
+    $SCRIPT_NAME --list-remote --type vscodium # List available vscodium versions
+    $SCRIPT_NAME --cleanup
+    $SCRIPT_NAME --install-service          # Install service for current version
+    $SCRIPT_NAME 4.22.1 --install-service  # Install version and create service
+    $SCRIPT_NAME --remove-service           # Remove systemd service
+EOF
+}
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >&2
+}
+
+error() {
+    log "ERROR: $*"
+    exit 1
+}
+
+cleanup_temp() {
+    if [[ -d "$TEMP_DIR" ]]; then
+        log "Cleaning up temporary directory: $TEMP_DIR"
+        rm -rf "$TEMP_DIR"
+    fi
+}
+
+trap cleanup_temp EXIT
+
+validate_version() {
+    local version="$1"
+    local server_type="${2:-code-server}"
+    local skip_remote="${3:-false}"
+    
+    if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        error "Invalid version format: $version. Expected format: X.Y.Z (e.g., 4.22.1 for code-server, 1.103.1 for openvscode)"
+    fi
+    
+    # Optionally validate against remote versions (skip in dry-run or if requested)
+    if [[ "$skip_remote" != "true" && "${DRY_RUN:-}" != "1" ]]; then
+        validate_remote_version "$version" "$server_type" || {
+            log "Proceeding anyway (version may exist but not be listed in releases)"
+        }
+    fi
+}
+
+validate_server_type() {
+    local server_type="$1"
+    case "$server_type" in
+        code-server|openvscode|vscodium)
+            return 0
+            ;;
+        *)
+            error "Invalid server type: $server_type. Supported types: code-server, openvscode, vscodium"
+            ;;
+    esac
+}
+
+get_server_config() {
+    local server_type="$1"
+    local config_type="$2"
+    
+    case "$server_type" in
+        code-server)
+            case "$config_type" in
+                binary_name) echo "code-server" ;;
+                default_args) echo "--bind-addr 0.0.0.0:8080 --auth none --disable-telemetry" ;;
+                url_template) echo "https://github.com/coder/code-server/releases/download/v{VERSION}/code-server-{VERSION}-linux-amd64.tar.gz" ;;
+                archive_name) echo "code-server-{VERSION}.tar.gz" ;;
+                extract_pattern) echo "code-server-*" ;;
+                repo) echo "coder/code-server" ;;
+                version_prefix) echo "v" ;;
+            esac
+            ;;
+        openvscode)
+            case "$config_type" in
+                binary_name) echo "openvscode-server" ;;
+                default_args) echo "--host 0.0.0.0 --port 8080 --without-connection-token" ;;
+                url_template) echo "https://github.com/gitpod-io/openvscode-server/releases/download/openvscode-server-v{VERSION}/openvscode-server-v{VERSION}-linux-x64.tar.gz" ;;
+                archive_name) echo "openvscode-server-v{VERSION}.tar.gz" ;;
+                extract_pattern) echo "openvscode-server-*" ;;
+                repo) echo "gitpod-io/openvscode-server" ;;
+                version_prefix) echo "openvscode-server-v" ;;
+            esac
+            ;;
+        vscodium)
+            case "$config_type" in
+                binary_name) echo "vscodium" ;;
+                default_args) echo "--bind-addr 0.0.0.0:8080 --auth none --disable-telemetry" ;;
+                url_template) echo "https://github.com/VSCodium/vscodium/releases/download/{VERSION}/vscodium-reh-web-linux-x64-{VERSION}.tar.gz" ;;
+                archive_name) echo "vscodium-reh-web-linux-x64-{VERSION}.tar.gz" ;;
+                extract_pattern) echo "vscodium-reh-web-linux-x64-*" ;;
+                repo) echo "VSCodium/vscodium" ;;
+                version_prefix) echo "" ;;
+            esac
+            ;;
+    esac
+}
+
+get_service_mode() {
+    if [[ "$IS_ROOT" == "true" ]]; then
+        echo "system"
+    else
+        echo "user"
+    fi
+}
+
+verify_download() {
+    local archive_path="$1"
+    local server_type="$2"
+    local version="$3"
+    
+    if [[ ! -f "$archive_path" ]] || [[ ! -s "$archive_path" ]]; then
+        error "Downloaded file is missing or empty: $archive_path"
+    fi
+    
+    if ! file "$archive_path" | grep -q "gzip compressed"; then
+        error "Downloaded file is not a valid gzip archive: $archive_path"
+    fi
+}
+
+parse_version_dir() {
+    local version_dir="$1"
+    local server_type version
+    
+    if [[ "$version_dir" =~ ^([^-]+)-(.+)$ ]]; then
+        server_type="${BASH_REMATCH[1]}"
+        version="${BASH_REMATCH[2]}"
+        echo "$server_type $version"
+    else
+        error "Could not parse server type and version from: $version_dir"
+    fi
+}
+
+fetch_remote_versions() {
+    local server_type="$1"
+    local repo
+    repo="$(get_server_config "$server_type" "repo")"
+    
+    if [[ -z "$repo" ]]; then
+        error "Repository not configured for server type: $server_type"
+    fi
+    
+    log "Fetching available versions for $server_type from GitHub..."
+    
+    # Use GitHub API to get releases
+    local api_url="https://api.github.com/repos/$repo/releases"
+    local releases
+    
+    if ! releases=$(wget -qO- "$api_url" 2>/dev/null); then
+        error "Failed to fetch releases from GitHub API: $api_url"
+    fi
+    
+    # Parse JSON to extract version tags
+    echo "$releases" | grep -o '"tag_name": *"[^"]*"' | cut -d'"' -f4
+}
+
+list_remote_versions() {
+    local server_type="${1:-code-server}"
+    local version_prefix
+    version_prefix="$(get_server_config "$server_type" "version_prefix")"
+    
+    local versions
+    versions="$(fetch_remote_versions "$server_type")"
+    
+    if [[ -z "$versions" ]]; then
+        echo "No remote versions found for $server_type"
+        return
+    fi
+    
+    echo "Available $server_type versions (latest 20):"
+    echo "$versions" | grep "^$version_prefix" | sed "s/^$version_prefix//" | head -20 | while read -r version; do
+        echo "  $version"
+    done
+}
+
+get_latest_version() {
+    local server_type="${1:-code-server}"
+    local version_prefix
+    version_prefix="$(get_server_config "$server_type" "version_prefix")"
+    
+    local versions
+    versions="$(fetch_remote_versions "$server_type")"
+    
+    if [[ -z "$versions" ]]; then
+        error "No remote versions found for $server_type"
+    fi
+    
+    # Get the first (latest) version that matches the prefix and doesn't contain pre-release indicators
+    echo "$versions" | grep "^$version_prefix" | grep -v -E "(rc|alpha|beta|pre)" | sed "s/^$version_prefix//" | head -1
+}
+
+validate_remote_version() {
+    local version="$1"
+    local server_type="${2:-code-server}"
+    local version_prefix
+    version_prefix="$(get_server_config "$server_type" "version_prefix")"
+    
+    local remote_versions
+    remote_versions="$(fetch_remote_versions "$server_type")"
+    
+    local full_version="$version_prefix$version"
+    if echo "$remote_versions" | grep -q "^$full_version$"; then
+        return 0
+    else
+        log "Warning: Version $version not found in GitHub releases for $server_type"
+        log "Use '$SCRIPT_NAME --list-remote --type $server_type' to see available versions"
+        return 1
+    fi
+}
+
+check_prerequisites() {
+    for cmd in wget tar systemctl; do
+        if ! command -v "$cmd" &> /dev/null; then
+            error "Required command not found: $cmd"
+        fi
+    done
+
+    # Validate target user exists in root mode
+    if [[ "$IS_ROOT" == "true" ]] && ! id "$TARGET_USER" &>/dev/null; then
+        error "Target user $TARGET_USER does not exist"
+    fi
+
+    # Create codectl directories if they don't exist
+    mkdir -p "$CODECTL_HOME" "$VERSIONS_DIR" "$SYSTEMD_DIR"
+    mkdir -p "$(dirname "$TEMP_DIR")"
+}
+
+service_status() {
+    $SYSTEMCTL_CMD is-active --quiet "$SERVICE_NAME" 2>/dev/null
+}
+
+stop_service() {
+    if service_status; then
+        log "Stopping $SERVICE_NAME service"
+        if [[ "${DRY_RUN:-}" != "1" ]]; then
+            $SYSTEMCTL_CMD stop "$SERVICE_NAME"
+        fi
+        return 0
+    else
+        log "$SERVICE_NAME service is not running"
+        return 1
+    fi
+}
+
+start_service() {
+    log "Starting $SERVICE_NAME service"
+    if [[ "${DRY_RUN:-}" != "1" ]]; then
+        $SYSTEMCTL_CMD start "$SERVICE_NAME"
+        
+        # Wait for service to start and verify
+        local count=0
+        while ! service_status && [[ $count -lt 10 ]]; do
+            sleep 1
+            ((count++))
+        done
+        
+        if service_status; then
+            log "$SERVICE_NAME service started successfully"
+        else
+            error "$SERVICE_NAME service failed to start"
+        fi
+    fi
+}
+
+get_current_version() {
+    if [[ -L "$INSTALL_DIR" && -d "$INSTALL_DIR" ]]; then
+        basename "$(readlink "$INSTALL_DIR")"
+    else
+        echo "none"
+    fi
+}
+
+list_versions() {
+    if [[ -d "$VERSIONS_DIR" ]]; then
+        local current_version
+        current_version="$(get_current_version)"
+        
+        echo "Installed versions:"
+        for dir in "$VERSIONS_DIR"/*; do
+            if [[ -d "$dir" ]]; then
+                local dir_name
+                dir_name="$(basename "$dir")"
+                if [[ "$dir_name" == "$current_version" ]]; then
+                    echo "  $dir_name (current)"
+                else
+                    echo "  $dir_name"
+                fi
+            fi
+        done
+    else
+        echo "No versions installed"
+    fi
+}
+
+download_version() {
+    local version="$1"
+    local server_type="${2:-code-server}"
+    
+    local url_template archive_name
+    url_template="$(get_server_config "$server_type" "url_template")"
+    archive_name="$(get_server_config "$server_type" "archive_name")"
+    
+    if [[ -z "$url_template" || -z "$archive_name" ]]; then
+        error "Unsupported server type: $server_type"
+    fi
+    
+    local url="${url_template//\{VERSION\}/$version}"
+    local archive_path="$TEMP_DIR/${archive_name//\{VERSION\}/$version}"
+    
+    log "Downloading $server_type v$version"
+    if [[ "${DRY_RUN:-}" != "1" ]]; then
+        mkdir -p "$TEMP_DIR"
+        if ! wget --progress=dot:giga -O "$archive_path" "$url"; then
+            error "Failed to download $server_type v$version from $url"
+        fi
+        
+        # Verify download
+        verify_download "$archive_path" "$server_type" "$version"
+    fi
+    
+    echo "$archive_path"
+}
+
+extract_version() {
+    local archive_path="$1"
+    local version="$2"
+    local server_type="${3:-code-server}"
+    local extract_dir="$TEMP_DIR/extract"
+    local version_dir="$VERSIONS_DIR/$server_type-$version"
+    
+    log "Extracting $server_type v$version"
+    if [[ "${DRY_RUN:-}" != "1" ]]; then
+        mkdir -p "$extract_dir"
+        if ! tar -xzf "$archive_path" -C "$extract_dir"; then
+            error "Failed to extract archive: $archive_path"
+        fi
+        
+        # Find the extracted directory
+        local extract_pattern binary_name
+        extract_pattern="$(get_server_config "$server_type" "extract_pattern")"
+        binary_name="$(get_server_config "$server_type" "binary_name")"
+        
+        local extracted_dir
+        extracted_dir="$(find "$extract_dir" -maxdepth 1 -type d -name "$extract_pattern" | head -n1)"
+        local binary_path="$extracted_dir/bin/$binary_name"
+        
+        if [[ -z "$extracted_dir" ]]; then
+            error "Could not find extracted $server_type directory"
+        fi
+        
+        # Verify the binary exists and is executable
+        if [[ ! -f "$binary_path" ]]; then
+            error "$server_type binary not found in extracted archive"
+        fi
+        
+        # Move to versions directory
+        mkdir -p "$VERSIONS_DIR"
+        if [[ -d "$version_dir" ]]; then
+            log "Removing existing version directory: $version_dir"
+            rm -rf "$version_dir"
+        fi
+        
+        mv "$extracted_dir" "$version_dir"
+        
+        # Set ownership if running as root
+        if [[ "$IS_ROOT" == "true" ]]; then
+            chown -R "$TARGET_USER:$TARGET_GROUP" "$version_dir"
+        fi
+        
+        # Update binary path after move
+        chmod +x "$version_dir/bin/$binary_name"
+        
+        log "Installed $server_type v$version to $version_dir"
+    fi
+    
+    echo "$version_dir"
+}
+
+switch_version() {
+    local version="$1"
+    local server_type="${2:-code-server}"
+    local version_dir="$VERSIONS_DIR/$server_type-$version"
+    local backup_link=""
+    
+    if [[ ! -d "$version_dir" ]]; then
+        error "Version $version for $server_type is not installed. Run: $SCRIPT_NAME $version --type $server_type"
+    fi
+    
+    log "Switching to $server_type v$version"
+    if [[ "${DRY_RUN:-}" != "1" ]]; then
+        # Backup current symlink if it exists
+        if [[ -L "$INSTALL_DIR" ]]; then
+            backup_link="$(readlink "$INSTALL_DIR")"
+            log "Backing up current symlink: $INSTALL_DIR -> $backup_link"
+        fi
+        
+        # Create new symlink
+        rm -f "$INSTALL_DIR"
+        ln -sf "$version_dir" "$INSTALL_DIR"
+        
+        # Verify symlink
+        if [[ ! -L "$INSTALL_DIR" ]] || [[ ! -d "$INSTALL_DIR" ]]; then
+            # Restore backup if creation failed
+            if [[ -n "$backup_link" ]]; then
+                ln -sf "$backup_link" "$INSTALL_DIR"
+            fi
+            error "Failed to create symlink: $INSTALL_DIR -> $version_dir"
+        fi
+        
+        log "Successfully switched to $server_type v$version"
+    fi
+}
+
+rollback_version() {
+    local current_version
+    current_version="$(get_current_version)"
+    
+    if [[ "$current_version" == "none" ]]; then
+        error "No current installation to rollback from"
+    fi
+    
+    # Find previous version (second most recent)
+    local versions
+    mapfile -t versions < <(find "$VERSIONS_DIR" -maxdepth 1 -type d -printf "%T@ %f\n" 2>/dev/null | sort -nr | cut -d' ' -f2)
+    
+    if [[ ${#versions[@]} -lt 2 ]]; then
+        error "No previous version available for rollback. Installed versions: ${versions[*]:-none}"
+    fi
+    
+    local previous_version=""
+    for version_dir in "${versions[@]}"; do
+        if [[ "$version_dir" != "$current_version" ]]; then
+            previous_version="$version_dir"
+            break
+        fi
+    done
+    
+    if [[ -z "$previous_version" ]]; then
+        error "Could not determine previous version for rollback"
+    fi
+    
+    # Extract server type and version from directory name
+    local server_type version
+    read -r server_type version <<< "$(parse_version_dir "$previous_version")"
+    
+    log "Rolling back from $current_version to $previous_version"
+    
+    local was_running=false
+    if stop_service; then
+        was_running=true
+    fi
+    
+    switch_version "$version" "$server_type"
+    
+    if [[ "$was_running" == "true" ]]; then
+        start_service
+    fi
+    
+    log "Rollback completed successfully"
+}
+
+cleanup_old_versions() {
+    local current_version
+    current_version="$(get_current_version)"
+    
+    if [[ "$current_version" == "none" ]]; then
+        log "No current version, cannot cleanup"
+        return
+    fi
+    
+    # Keep current + 2 most recent versions
+    local versions_to_keep=3
+    local versions
+    mapfile -t versions < <(find "$VERSIONS_DIR" -maxdepth 1 -type d -printf "%T@ %f\n" 2>/dev/null | sort -nr | head -n "$versions_to_keep" | cut -d' ' -f2)
+    
+    log "Keeping $versions_to_keep most recent versions: ${versions[*]}"
+    
+    if [[ "${DRY_RUN:-}" != "1" ]]; then
+        for dir in "$VERSIONS_DIR"/*; do
+            if [[ -d "$dir" ]]; then
+                local dir_name
+                dir_name="$(basename "$dir")"
+                local should_keep=false
+                
+                for keep_version in "${versions[@]}"; do
+                    if [[ "$dir_name" == "$keep_version" ]]; then
+                        should_keep=true
+                        break
+                    fi
+                done
+                
+                if [[ "$should_keep" == "false" ]]; then
+                    log "Removing old version: $dir"
+                    rm -rf "$dir"
+                fi
+            fi
+        done
+    fi
+}
+
+install_version() {
+    local version="$1"
+    local server_type="${2:-code-server}"
+    local version_dir="$VERSIONS_DIR/$server_type-$version"
+    
+    # Check if version is already installed
+    if [[ -d "$version_dir" ]]; then
+        log "Version $version for $server_type is already installed"
+        local current_version
+        current_version="$(get_current_version)"
+        if [[ "$current_version" == "$server_type-$version" ]]; then
+            log "Version $version for $server_type is already active"
+            return
+        else
+            log "Switching to existing version $version for $server_type"
+            switch_version "$version" "$server_type"
+            return
+        fi
+    fi
+    
+    local was_running=false
+    if stop_service; then
+        was_running=true
+    fi
+    
+    # Download and extract
+    local archive_path
+    archive_path="$(download_version "$version" "$server_type")"
+    extract_version "$archive_path" "$version" "$server_type"
+    
+    # Switch to new version
+    if [[ "${DRY_RUN:-}" != "1" ]]; then
+        switch_version "$version" "$server_type"
+    else
+        log "Would switch to $server_type v$version"
+    fi
+    
+    # Start service if it was running before
+    if [[ "$was_running" == "true" ]]; then
+        start_service
+    fi
+    
+    log "Successfully installed and activated $server_type v$version"
+}
+
+generate_service_file() {
+    local version="$1"
+    local server_type="${2:-code-server}"
+    local version_dir="$VERSIONS_DIR/$server_type-$version"
+    
+    if [[ "${DRY_RUN:-}" != "1" && ! -d "$version_dir" ]]; then
+        error "Version $version for $server_type is not installed"
+    fi
+    
+    local binary_name default_args
+    binary_name="$(get_server_config "$server_type" "binary_name")"
+    default_args="$(get_server_config "$server_type" "default_args")"
+    
+    local target_home user_group_config install_target
+    
+    if [[ "$IS_ROOT" == "true" ]]; then
+        target_home="/home/$TARGET_USER"
+        user_group_config="User=$TARGET_USER\nGroup=$TARGET_GROUP"
+        install_target="multi-user.target"
+    else
+        target_home="$HOME"
+        user_group_config=""
+        install_target="default.target"
+    fi
+    
+    cat << EOF
+[Unit]
+Description=VS Code Server ($server_type v$version)
+After=network.target
+
+[Service]
+Type=exec
+ExecStart=$version_dir/bin/$binary_name $default_args
+Restart=on-failure
+RestartSec=5
+Environment=HOME=$target_home
+WorkingDirectory=$target_home
+$(if [[ -n "$user_group_config" ]]; then echo -e "$user_group_config"; fi)
+
+# Security settings
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=$install_target
+EOF
+}
+
+install_service() {
+    local version="${1:-}"
+    local server_type="${2:-code-server}"
+    local current_version
+    
+    # If no version specified, use current version
+    if [[ -z "$version" ]]; then
+        current_version="$(get_current_version)"
+        if [[ "$current_version" == "none" ]]; then
+            error "No version installed and no version specified"
+        fi
+        
+        # Parse server type and version from current installation
+        read -r server_type version <<< "$(parse_version_dir "$current_version")"
+        
+        log "Using current version: $server_type v$version"
+    fi
+    
+    local service_file="$SYSTEMD_DIR/$SERVICE_NAME.service"
+    
+    local service_type
+    service_type="$(get_service_mode)"
+    
+    log "Installing systemd $service_type service for $server_type v$version"
+    if [[ "${DRY_RUN:-}" != "1" ]]; then
+        # Stop existing service if running
+        if $SYSTEMCTL_CMD is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+            log "Stopping existing $SERVICE_NAME service"
+            $SYSTEMCTL_CMD stop "$SERVICE_NAME"
+        fi
+        
+        # Generate and install service file
+        generate_service_file "$version" "$server_type" > "$service_file"
+        
+        # Reload systemd and enable service
+        $SYSTEMCTL_CMD daemon-reload
+        $SYSTEMCTL_CMD enable "$SERVICE_NAME"
+        
+        log "Service installed and enabled: $SERVICE_NAME"
+        if [[ "$IS_ROOT" == "true" ]]; then
+            log "Start with: systemctl start $SERVICE_NAME"
+            log "Check status with: systemctl status $SERVICE_NAME"
+        else
+            log "Start with: systemctl --user start $SERVICE_NAME"
+            log "Check status with: systemctl --user status $SERVICE_NAME"
+            log "Enable lingering to start on boot: sudo loginctl enable-linger $TARGET_USER"
+        fi
+    else
+        log "Would install service file to: $service_file"
+        log "Service content:"
+        generate_service_file "$version" "$server_type"
+    fi
+}
+
+remove_service() {
+    local service_file="$SYSTEMD_DIR/$SERVICE_NAME.service"
+    local service_type
+    service_type="$(get_service_mode)"
+    
+    log "Removing systemd $service_type service: $SERVICE_NAME"
+    if [[ "${DRY_RUN:-}" != "1" ]]; then
+        # Stop and disable service
+        if $SYSTEMCTL_CMD is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+            log "Stopping $SERVICE_NAME service"
+            $SYSTEMCTL_CMD stop "$SERVICE_NAME"
+        fi
+        
+        if $SYSTEMCTL_CMD is-enabled --quiet "$SERVICE_NAME" 2>/dev/null; then
+            log "Disabling $SERVICE_NAME service"
+            $SYSTEMCTL_CMD disable "$SERVICE_NAME"
+        fi
+        
+        # Remove service file
+        if [[ -f "$service_file" ]]; then
+            rm -f "$service_file"
+            $SYSTEMCTL_CMD daemon-reload
+            log "Service file removed: $service_file"
+        else
+            log "Service file not found: $service_file"
+        fi
+    else
+        log "Would remove service file: $service_file"
+    fi
+}
+
+show_service_status() {
+    local service_type
+    service_type="$(get_service_mode)"
+    
+    log "Service status for $SERVICE_NAME ($service_type service):"
+    if $SYSTEMCTL_CMD is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+        echo "Status: Active"
+        $SYSTEMCTL_CMD status "$SERVICE_NAME" --no-pager -l
+    else
+        echo "Status: Inactive"
+        if $SYSTEMCTL_CMD is-enabled --quiet "$SERVICE_NAME" 2>/dev/null; then
+            echo "Enabled: Yes"
+        else
+            echo "Enabled: No"
+        fi
+    fi
+}
+
+main() {
+    local action=""
+    local version=""
+    local server_type="code-server"
+    local install_service_after=false
+    
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --type)
+                shift
+                if [[ $# -eq 0 ]]; then
+                    error "--type requires a value"
+                fi
+                server_type="$1"
+                validate_server_type "$server_type"
+                shift
+                ;;
+            --rollback)
+                action="rollback"
+                shift
+                ;;
+            --list)
+                action="list"
+                shift
+                ;;
+            --list-remote)
+                action="list-remote"
+                shift
+                ;;
+            --latest)
+                action="latest"
+                shift
+                ;;
+            --current)
+                action="current"
+                shift
+                ;;
+            --cleanup)
+                action="cleanup"
+                shift
+                ;;
+            --install-service)
+                if [[ -n "$action" && "$action" != "install" ]]; then
+                    action="install-service"
+                else
+                    install_service_after=true
+                fi
+                shift
+                ;;
+            --remove-service)
+                action="remove-service"
+                shift
+                ;;
+            --service-status)
+                action="service-status"
+                shift
+                ;;
+            --dry-run)
+                DRY_RUN=1
+                shift
+                ;;
+            --help|-h)
+                usage
+                exit 0
+                ;;
+            -*)
+                error "Unknown option: $1"
+                ;;
+            *)
+                if [[ -n "$version" ]]; then
+                    error "Multiple versions specified: $version and $1"
+                fi
+                version="$1"
+                action="install"
+                shift
+                ;;
+        esac
+    done
+    
+    # Set default action if no version or action specified
+    if [[ -z "$action" ]]; then
+        if [[ -z "$version" ]]; then
+            usage
+            exit 1
+        else
+            action="install"
+        fi
+    fi
+    
+    check_prerequisites
+    
+    case "$action" in
+        install)
+            if [[ -z "$version" ]]; then
+                error "Version is required for installation"
+            fi
+            validate_version "$version" "$server_type"
+            install_version "$version" "$server_type"
+            
+            # Install service after version installation if requested
+            if [[ "$install_service_after" == "true" ]]; then
+                install_service "$version" "$server_type"
+            fi
+            ;;
+        install-service)
+            install_service "$version" "$server_type"
+            ;;
+        remove-service)
+            remove_service
+            ;;
+        service-status)
+            show_service_status
+            ;;
+        rollback)
+            rollback_version
+            ;;
+        list)
+            list_versions
+            ;;
+        list-remote)
+            list_remote_versions "$server_type"
+            ;;
+        latest)
+            version="$(get_latest_version "$server_type")"
+            log "Installing latest $server_type version: $version"
+            validate_version "$version" "$server_type" "true"  # Skip remote validation since we just fetched it
+            install_version "$version" "$server_type"
+            
+            # Install service after version installation if requested
+            if [[ "$install_service_after" == "true" ]]; then
+                install_service "$version" "$server_type"
+            fi
+            ;;
+        current)
+            echo "Current version: $(get_current_version)"
+            ;;
+        cleanup)
+            cleanup_old_versions
+            ;;
+        *)
+            error "Unknown action: $action"
+            ;;
+    esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
