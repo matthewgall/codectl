@@ -44,7 +44,7 @@
 ### Installation
 ```bash
 # Download codectl
-wget https://raw.githubusercontent.com/your-repo/codectl/main/codectl
+wget https://raw.githubusercontent.com/matthewgall/codectl/main/codectl
 chmod +x codectl
 
 # Move to system PATH (optional)
